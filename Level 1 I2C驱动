@@ -19,3 +19,270 @@
 ④ 重复：重复步骤 2 和 3，直到处理完所有被除数位。
 ⑤ 结果：最终得到的商就是模 2 除法的商，最后剩下的部分（位数比除数少一位）就是余数（Remainder）。
 
+太棒了！进入 Level 1 意味着你要开始写代码控制硬件了。
+
+你说你要“彻底搞懂 I2C 驱动”，这非常有眼光。在面试中，能手写 I2C 时序和能调用 HAL 库是两个完全不同的薪资段位。
+
+对于 BQ76930 这个芯片，它的 I2C 有两个特殊点：
+
+时序严格：标准的 I2C 协议。
+
+强制 CRC-8 校验：这是 TI 电池芯片的“看门狗”，如果你发的数据没有带上正确的 CRC 校验码，芯片会认为数据被干扰了，直接丢弃不理你。
+
+下面我把 I2C 驱动拆解为 物理层（GPIO操作）、协议层（时序） 和 应用层（BQ76930 特有的 CRC） 三部分来教你。
+
+第一部分：物理层 (怎么连线与配置)
+
+I2C 只有两根线：
+
+SCL (Serial Clock)：时钟线，你（MCU）是老大，你来控制节奏（高低电平切换）。
+
+SDA (Serial Data)：数据线，数据双向传输。
+
+关键电路知识（面试必问）：
+I2C 是 “开漏输出 (Open-Drain)” 结构。
+
+这意味着 MCU 和 BQ76930 都只能输出低电平（拉低），不能输出高电平。
+
+高电平从哪来？ 靠外部的 上拉电阻（Pull-up Resistor，通常 4.7kΩ 或 10kΩ）拉到 3.3V。
+
+如果不接上拉电阻：SCL 和 SDA 永远是 0V，通信必定失败。
+
+代码准备 (STM32 HAL库为例)：
+配置两个 GPIO（例如 PB6 和 PB7）为 GPIO_MODE_OUTPUT_OD (开漏输出)，速度选 High。
+
+我们要定义 4 个宏，方便后面写代码：
+
+code
+C
+download
+content_copy
+expand_less
+// 假设 SCL 接 PB6, SDA 接 PB7
+#define I2C_SCL_H()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET)   // 松手，让电阻拉高
+#define I2C_SCL_L()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET) //以此力拉低
+
+#define I2C_SDA_H()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET)
+#define I2C_SDA_L()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET)
+
+#define I2C_SDA_READ() HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) // 读 SDA 电平
+第二部分：协议层 (手搓时序)
+
+I2C 的通信就像打电话，有固定的套路。我们需要实现 4 个基础动作：
+
+1. 起始信号 (Start)
+
+定义：SCL 为高电平时，SDA 由高变低。
+
+code
+C
+download
+content_copy
+expand_less
+void I2C_Start(void) {
+    I2C_SDA_H();
+    I2C_SCL_H();
+    delay_us(5); // 延时保证信号稳定
+    I2C_SDA_L(); // SCL高的时候，SDA拉低，代表 Start
+    delay_us(5);
+    I2C_SCL_L(); // 钳住总线，准备发送数据
+}
+2. 停止信号 (Stop)
+
+定义：SCL 为高电平时，SDA 由低变高。
+
+code
+C
+download
+content_copy
+expand_less
+void I2C_Stop(void) {
+    I2C_SCL_L();
+    I2C_SDA_L();
+    delay_us(5);
+    I2C_SCL_H();
+    delay_us(5);
+    I2C_SDA_H(); // SCL高的时候，SDA拉高，代表 Stop
+}
+3. 发送一个字节 (Send Byte)
+
+逻辑：SCL 低电平时放数据，SCL 高电平时对方读数据。高位先发 (MSB First)。
+
+code
+C
+download
+content_copy
+expand_less
+// 返回值：1=收到ACK（成功），0=没收到ACK（失败）
+uint8_t I2C_SendByte(uint8_t data) {
+    uint8_t i;
+    for(i = 0; i < 8; i++) {
+        // 1. 准备数据位
+        if(data & 0x80) I2C_SDA_H();
+        else            I2C_SDA_L();
+        data <<= 1; 
+        
+        // 2. 产生时钟脉冲让对方读
+        delay_us(2);
+        I2C_SCL_H(); 
+        delay_us(5); 
+        I2C_SCL_L(); 
+        delay_us(2);
+    }
+    
+    // 3. 接收应答 (ACK)
+    I2C_SDA_H(); // 释放SDA，把控制权交给 BQ76930
+    delay_us(2);
+    I2C_SCL_H(); // 拉高 SCL，看看 SDA 是什么电平
+    delay_us(2);
+    
+    uint8_t ack = 0;
+    if(I2C_SDA_READ() == 0) ack = 1; // 如果 SDA 被拉低，说明对方回应了 ACK
+    
+    I2C_SCL_L(); // 结束
+    return ack;
+}
+4. 读取一个字节 (Read Byte)
+code
+C
+download
+content_copy
+expand_less
+uint8_t I2C_ReadByte(uint8_t ack) {
+    uint8_t i, data = 0;
+    I2C_SDA_H(); // 释放总线，准备接收
+    for(i = 0; i < 8; i++) {
+        data <<= 1;
+        I2C_SCL_H(); // 拉高 SCL，数据稳定
+        delay_us(2);
+        if(I2C_SDA_READ()) data |= 0x01; // 读入一位
+        I2C_SCL_L(); // 拉低 SCL，让对方准备下一位
+        delay_us(2);
+    }
+    
+    // 发送应答
+    if(ack) I2C_SDA_L(); // ACK
+    else    I2C_SDA_H(); // NACK (不想读了)
+    
+    delay_us(2);
+    I2C_SCL_H();
+    delay_us(5);
+    I2C_SCL_L();
+    
+    return data;
+}
+第三部分：应用层 (BQ76930 的 CRC-8)
+
+这是 BQ76930 最恶心也最核心的地方。
+TI 规定：每写一个字节，后面必须紧跟一个 CRC 校验码。
+公式是：CRC-8 (Polynomial: 
+𝑥
+8
++
+𝑥
+2
++
+𝑥
++
+1
+x
+8
++x
+2
++x+1
+, 也就是 0x07)。
+
+你需要把这段代码复制到你的工程里：
+
+code
+C
+download
+content_copy
+expand_less
+// 计算 CRC-8 的函数
+// ptr: 数据数组指针, len: 数据长度
+uint8_t CRC8_Calc(uint8_t *ptr, uint8_t len) {
+    uint8_t crc = 0;
+    while(len--) {
+        crc ^= *ptr++; // 把新数据异或进来
+        for(uint8_t i = 0; i < 8; i++) {
+            if(crc & 0x80) {
+                crc = (crc << 1) ^ 0x07; // 如果最高位是1，移位并异或多项式
+            } else {
+                crc = crc << 1; // 否则只移位
+            }
+        }
+    }
+    return crc;
+}
+第四部分：完整实战 —— 怎么写寄存器？
+
+假设你要把 BQ76930 的 SYS_CTRL1 (地址 0x04) 寄存器写为 0x18 (开启 ADC 和 CC)。
+
+数据包结构：
+[设备地址(写)] + [寄存器地址] + [数据] + [CRC校验码]
+
+代码实现：
+
+code
+C
+download
+content_copy
+expand_less
+#define BQ76930_I2C_ADDR  (0x08 << 1) // 假设 I2C 地址是 0x08，左移一位变成写地址
+
+void BQ76930_WriteReg(uint8_t reg_addr, uint8_t data) {
+    uint8_t crc_buffer[3];
+    uint8_t crc_result;
+
+    // 1. 准备计算 CRC 的数据
+    crc_buffer[0] = BQ76930_I2C_ADDR;     // 设备写地址
+    crc_buffer[1] = reg_addr;             // 寄存器地址
+    crc_buffer[2] = data;                 // 要写的数据
+    
+    // 2. 算出 CRC
+    crc_result = CRC8_Calc(crc_buffer, 3);
+    
+    // 3. 开始发送 I2C
+    I2C_Start();
+    I2C_SendByte(BQ76930_I2C_ADDR); // 发送设备地址
+    I2C_SendByte(reg_addr);         // 发送寄存器地址
+    I2C_SendByte(data);             // 发送数据
+    I2C_SendByte(crc_result);       // 发送 CRC！这是关键！
+    I2C_Stop();
+}
+第五部分：你的作业 (Level 1 验收标准)
+
+你需要做以下几步来验证你是否“彻底搞懂”了：
+
+硬件连接：
+
+STM32 (PB6/PB7) 连接 BQ76930 (SCL/SDA)。
+
+重点：在 SCL 和 SDA 线上，分别接一个 4.7kΩ 电阻到 3.3V（这叫上拉）。不接绝对通不了！
+
+写代码：
+
+把上面的 I2C_Start, I2C_Stop 等函数复制进你的工程。
+
+把 CRC8_Calc 复制进去。
+
+读 ID (最简单的测试)：
+
+BQ76930 的 I2C 地址通常是 0x08 或 0x18。
+
+尝试调用 I2C_Start() -> I2C_SendByte(0x08 << 1)。
+
+如果 I2C_SendByte 返回 1 (ACK)，恭喜你，I2C 物理层通了！如果返回 0，检查接线。
+
+进阶作业：
+
+尝试写一个 BQ76930_ReadReg(uint8_t reg_addr) 函数。注意读的时候，CRC 的计算方式略有不同（要包含重启动信号后的读地址）。
+
+现在，你有两个选择：
+
+你手里有 STM32 板子和示波器/逻辑分析仪吗？如果有，直接上机测波形。
+
+如果你还在等快递，先在 Keil/STM32CubeIDE 里把这几个函数敲出来，编译通过，随时准备烧录。
+
+这一步最枯燥，但是一旦 ACK 返回 1，你会兴奋得跳起来！遇到问题随时把代码发给我。
